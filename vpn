@@ -1,0 +1,476 @@
+#!/bin/bash
+
+# ============================================
+# WireGuard User Manager (vpn) - v1
+# init (apt + basic wg0.conf + iptables ACL + install)
+# and runtime (add/remove/list/restart/get)
+# ============================================
+
+set -e
+
+COMMAND=$1
+USERNAME=$2
+TYPE=$3
+TARGET=$4
+
+WG_IF="wg0"
+WG_CONF="/etc/wireguard/${WG_IF}.conf"
+BASE_DIR="/home/wireguard"
+
+CLIENT_DIR="$BASE_DIR/clients"
+KEY_DIR="$BASE_DIR/keys"
+LOG_FILE="$BASE_DIR/users.txt"
+
+SCRIPT_PATH="$(readlink -f "$0")"
+INSTALL_PATH="/usr/local/bin/vpn"
+
+ACL_CHAIN="WG_ACCESS"
+
+# ============================================
+# Detect public IP for endpoint (for distribution)
+# ============================================
+
+detect_public_ip() {
+    for svc in "ifconfig.me" "icanhazip.com" "ipinfo.io/ip"; do
+        ip=$(curl -s "https://$svc" 2>/dev/null || true)
+        if echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "$ip"
+            return
+        fi
+    done
+    echo ""
+}
+
+PUBLIC_IP="$(detect_public_ip)"
+if [ -n "$PUBLIC_IP" ]; then
+    ENDPOINT="${PUBLIC_IP}:51820"
+else
+    ENDPOINT="CHANGE_ME_PUBLIC_IP:51820"
+fi
+
+SERVER_PUBLIC_KEY=$(wg show "$WG_IF" public-key 2>/dev/null || true)
+
+# ============================================
+# GUIDE
+# ============================================
+
+show_guide() {
+    cat <<EOF
+==================================================
+Usage: vpn [init|start|add|remove|guide|list|restart|get]
+
+1. First-time full setup (WireGuard + basic wg0.conf + iptables ACL + install):
+   ./vpn init
+
+2. Only install this script to /usr/local/bin/vpn (no packages):
+   ./vpn start
+
+3. Add user:
+   vpn add <username> <full|single|multi> [target]
+
+   full:   access 10.0.0.0/24 + 192.168.219.0/24 (home LAN)
+           Example: vpn add user1 full
+
+   single: access VPN + one home IP
+           Example: vpn add user2 single 192.168.219.100
+
+   multi:  access VPN + multiple home IPs (comma separated)
+           Example: vpn add user3 multi 192.168.219.100,192.168.219.101
+
+4. Remove user:
+   vpn remove <username>
+
+5. List users (from wg0.conf + users.txt):
+   vpn list
+
+6. Restart WireGuard:
+   vpn restart
+
+7. Get client config:
+   vpn get <username>
+==================================================
+EOF
+}
+
+# ============================================
+# INSTALL SCRIPT ONLY
+# ============================================
+
+install_script_only() {
+    if [ "$SCRIPT_PATH" = "$INSTALL_PATH" ]; then
+        echo "Already installed at $INSTALL_PATH"
+        echo "Use: vpn guide"
+        return
+    fi
+
+    echo "Installing script to $INSTALL_PATH ..."
+    sudo cp "$SCRIPT_PATH" "$INSTALL_PATH"
+    sudo chmod +x "$INSTALL_PATH"
+
+    echo "Installed. Now you can run 'vpn ...' from anywhere."
+}
+
+# ============================================
+# IPTABLES ACL SETUP
+# ============================================
+
+ensure_acl_chain() {
+    sudo iptables -N "$ACL_CHAIN" 2>/dev/null || true
+
+    if ! sudo iptables -C FORWARD -i "$WG_IF" -j "$ACL_CHAIN" 2>/dev/null; then
+        sudo iptables -A FORWARD -i "$WG_IF" -j "$ACL_CHAIN"
+    fi
+}
+
+add_acl_rules() {
+    local src_ip="$1"   # 10.0.0.X
+    local type="$2"
+    local target="$3"
+
+    ensure_acl_chain
+
+    local rules
+    rules=$(sudo iptables -S "$ACL_CHAIN" 2>/dev/null | grep "$src_ip" || true)
+    if [ -n "$rules" ]; then
+        while IFS= read -r rule; do
+            sudo iptables ${rule/-A/-D}
+        done <<< "$rules"
+    fi
+
+    case "$type" in
+        full)
+            sudo iptables -A "$ACL_CHAIN" -s "$src_ip"/32 -d 192.168.219.0/24 -j ACCEPT
+            sudo iptables -A "$ACL_CHAIN" -s "$src_ip"/32 -j DROP
+            ;;
+        single)
+            if [ -z "$target" ]; then
+                echo "Error: single type requires target IP"
+                exit 1
+            fi
+            sudo iptables -A "$ACL_CHAIN" -s "$src_ip"/32 -d "$target"/32 -j ACCEPT
+            sudo iptables -A "$ACL_CHAIN" -s "$src_ip"/32 -j DROP
+            ;;
+        multi)
+            if [ -z "$target" ]; then
+                echo "Error: multi type requires target IPs"
+                exit 1
+            fi
+            IFS=',' read -ra arr <<< "$target"
+            for t in "${arr[@]}"; do
+                sudo iptables -A "$ACL_CHAIN" -s "$src_ip"/32 -d "$t"/32 -j ACCEPT
+            done
+            sudo iptables -A "$ACL_CHAIN" -s "$src_ip"/32 -j DROP
+            ;;
+        *)
+            echo "Unknown type for ACL: $type"
+            exit 1
+            ;;
+    esac
+}
+
+remove_acl_rules() {
+    local src_ip="$1"
+
+    local rules
+    rules=$(sudo iptables -S "$ACL_CHAIN" 2>/dev/null | grep "$src_ip" || true)
+    if [ -n "$rules" ]; then
+        while IFS= read -r rule; do
+            sudo iptables ${rule/-A/-D}
+        done <<< "$rules"
+    fi
+}
+
+# ============================================
+# FULL INIT (apt + wg0.conf + ACL + install)
+# ============================================
+
+init_full() {
+    echo "Running full init (dependencies + basic config + install)..."
+
+    # 1) WireGuard + curl
+    sudo apt update
+    sudo apt install -y wireguard wireguard-tools curl
+
+    # 2) basic wg0.conf
+    if [ ! -f "$WG_CONF" ]; then
+        echo "Creating basic $WG_CONF ..."
+        sudo mkdir -p /etc/wireguard
+
+        SERVER_PRIV=$(wg genkey)
+        SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
+
+        cat <<EOF | sudo tee "$WG_CONF" >/dev/null
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = $SERVER_PRIV
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
+PostUp = iptables -A FORWARD -o wg0 -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
+PostDown = iptables -D FORWARD -o wg0 -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+EOF
+        sudo chmod 600 "$WG_CONF"
+    else
+        echo "$WG_CONF already exists, skipping create."
+    fi
+
+    # 3) enable wg-quick
+    sudo systemctl enable "wg-quick@$WG_IF" || true
+
+    # 4) base dirs
+    sudo mkdir -p "$CLIENT_DIR" "$KEY_DIR"
+    sudo touch "$LOG_FILE"
+    sudo chown -R root:root "$BASE_DIR" 2>/dev/null || true
+
+    # 5) ACL chain
+    ensure_acl_chain
+
+    # 6) install script
+    install_script_only
+
+    echo "Full init complete. Use: vpn guide"
+}
+
+# ============================================
+# LIST USERS
+# ============================================
+
+list_users() {
+    echo "===================================="
+    echo "WireGuard users (from $WG_CONF):"
+    echo "===================================="
+
+    if [ ! -f "$WG_CONF" ]; then
+        echo "Config not found: $WG_CONF"
+        return
+    fi
+
+    printf "%-12s %-18s %-8s %-30s\n" \
+           "USERNAME" "VPN_IP(Allowed)" "TYPE" "TARGET"
+    printf "%-12s %-18s %-8s %-30s\n" \
+           "----------" "------------------" "--------" "------------------------------"
+
+    local name=""
+    local ip=""
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^#\ =====\  ]]; then
+            name=$(echo "$line" | sed -E 's/^# ===== ([^ ]+) =====.*$/\1/')
+            ip=""
+        elif [[ "$line" =~ ^AllowedIPs ]]; then
+            ip=$(echo "$line" | awk -F'=' '{print $2}' | awk '{print $1}')
+
+            local t=""; local target=""
+            if [ -f "$LOG_FILE" ]; then
+                local logline
+                logline=$(grep -m1 "^$name |" "$LOG_FILE" || true)
+                if [ -n "$logline" ]; then
+                    t=$(echo "$logline" | awk -F'|' '{print $3}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    target=$(echo "$logline" | awk -F'|' '{print $4}' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                fi
+            fi
+
+            printf "%-12s %-18s %-8s %-30s\n" "$name" "$ip" "$t" "$target"
+        fi
+    done < "$WG_CONF"
+
+    echo "===================================="
+}
+
+# ============================================
+# ADD USER
+# ============================================
+
+add_user() {
+    if [ -z "$SERVER_PUBLIC_KEY" ]; then
+        echo "Error: Could not get server public key. Is wg0 running?"
+        exit 1
+    fi
+
+    if [ -z "$USERNAME" ] || [ -z "$TYPE" ]; then
+        echo "Usage: vpn add <username> <full|single|multi> [target]"
+        exit 1
+    fi
+
+    mkdir -p "$CLIENT_DIR"
+    mkdir -p "$KEY_DIR"
+
+    LAST_IP=$(grep -o "10.0.0.[0-9]*" "$WG_CONF" | awk -F. '{print $4}' | sort -n | tail -1)
+    if [ -z "$LAST_IP" ]; then
+        NEXT_IP=2
+    else
+        NEXT_IP=$((LAST_IP + 1))
+    fi
+    IP="10.0.0.$NEXT_IP"
+
+    PRIVATE_KEY=$(wg genkey)
+    PUBLIC_KEY=$(echo "$PRIVATE_KEY" | wg pubkey)
+
+    echo "$PRIVATE_KEY" > "$KEY_DIR/${USERNAME}_privatekey"
+    echo "$PUBLIC_KEY"  > "$KEY_DIR/${USERNAME}_publickey"
+
+    cat <<EOF >> "$WG_CONF"
+
+# ===== $USERNAME =====
+[Peer]
+PublicKey = $PUBLIC_KEY
+AllowedIPs = $IP/32
+EOF
+
+    # client routing range, ACL is enforced by iptables
+    CLIENT_ALLOWED="10.0.0.0/24,192.168.219.0/24"
+
+    cat <<EOF > "$CLIENT_DIR/${USERNAME}.conf"
+[Interface]
+PrivateKey = $PRIVATE_KEY
+Address = $IP/32
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = $ENDPOINT
+AllowedIPs = $CLIENT_ALLOWED
+PersistentKeepalive = 25
+EOF
+
+    echo "$USERNAME | $IP | $TYPE | $TARGET | $(date)" >> "$LOG_FILE"
+
+    add_acl_rules "$IP" "$TYPE" "$TARGET"
+
+    echo "------------------------------------"
+    echo "User added: $USERNAME"
+    echo "VPN IP: $IP"
+    echo "Config: $CLIENT_DIR/${USERNAME}.conf"
+    echo "------------------------------------"
+}
+
+# ============================================
+# REMOVE USER
+# ============================================
+
+remove_user() {
+    if [ -z "$USERNAME" ]; then
+        echo "Usage: vpn remove <username>"
+        exit 1
+    fi
+
+    if [ ! -f "$KEY_DIR/${USERNAME}_publickey" ]; then
+        echo "User not found in keys dir: $USERNAME"
+        exit 1
+    fi
+
+    local ip
+    ip=$(grep "^$USERNAME |" "$LOG_FILE" 2>/dev/null | head -n1 | awk -F'|' '{print $2}' | tr -d ' ')
+
+    PUBLIC_KEY=$(cat "$KEY_DIR/${USERNAME}_publickey")
+
+    wg set "$WG_IF" peer "$PUBLIC_KEY" remove || true
+    wg-quick save "$WG_IF" || true
+
+    # remove block from wg0.conf
+    awk -v user="$USERNAME" '
+        BEGIN { skip=0 }
+        /^# ===== / {
+            name = $3
+            gsub(/=/, "", name)
+            if (name == user) {
+                skip=1
+                next
+            }
+        }
+        skip && /^\[Peer\]/ { next }
+        skip && /^$/ { skip=0; next }
+        skip { next }
+        { print }
+    ' "$WG_CONF" > "$WG_CONF.tmp" && mv "$WG_CONF.tmp" "$WG_CONF"
+
+    rm -f "$KEY_DIR/${USERNAME}_privatekey"
+    rm -f "$KEY_DIR/${USERNAME}_publickey"
+    rm -f "$CLIENT_DIR/${USERNAME}.conf"
+    sed -i "/^$USERNAME |/d" "$LOG_FILE" 2>/dev/null || true
+
+    if [ -n "$ip" ]; then
+        remove_acl_rules "$ip"
+    fi
+
+    echo "User removed: $USERNAME"
+}
+
+# ============================================
+# RESTART
+# ============================================
+
+restart_vpn() {
+    echo "Restarting WireGuard (wg-quick@$WG_IF)..."
+    sudo systemctl restart "wg-quick@$WG_IF"
+    sudo systemctl status "wg-quick@$WG_IF" --no-pager -l | head -n 5 || true
+}
+
+# ============================================
+# GET CONFIG
+# ============================================
+
+get_config() {
+    if [ -z "$USERNAME" ]; then
+        echo "Usage: vpn get <username>"
+        exit 1
+    fi
+
+    local file="$CLIENT_DIR/${USERNAME}.conf"
+
+    if [ ! -f "$file" ]; then
+        echo "Config not found: $file"
+        exit 1
+    fi
+
+    echo "===================================="
+    echo "Config for user: $USERNAME"
+    echo "Path: $file"
+    echo "===================================="
+    cat "$file"
+    echo "===================================="
+}
+
+# ============================================
+# MAIN
+# ============================================
+
+case "$COMMAND" in
+    init)
+        init_full
+        ;;
+    start)
+        install_script_only
+        ;;
+    add)
+        add_user
+        ;;
+    remove)
+        remove_user
+        ;;
+    guide)
+        show_guide
+        ;;
+    list)
+        list_users
+        ;;
+    restart)
+        restart_vpn
+        ;;
+    get)
+        get_config
+        ;;
+    *)
+        echo "Usage:"
+        echo "./vpn init   # first time, from repo dir (install + deps + wg0.conf)"
+        echo "./vpn start  # only install script to /usr/local/bin/vpn"
+        echo "vpn add <username> <full|single|multi> [target]"
+        echo "vpn remove <username>"
+        echo "vpn guide"
+        echo "vpn list"
+        echo "vpn restart"
+        echo "vpn get <username>"
+        exit 1
+        ;;
+esac
