@@ -40,7 +40,7 @@ Make sure the following are true:
 1. Clone the repo and make script executable:
 
    ```bash
-   git clone <your_repo_url> vpn-manager
+   git clone https://github.com/bssm-oss/wireguard-vpn-manager vpn-manager
    cd vpn-manager
    chmod +x vpn
    ```

@@ -40,7 +40,7 @@
 1. 리포지토리 클론 및 권한 설정:
 
    ```bash
-   git clone <your_repo_url> vpn-manager
+   git clone https://github.com/bssm-oss/wireguard-vpn-manager vpn-manager
    cd vpn-manager
    chmod +x vpn
    ```
