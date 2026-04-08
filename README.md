@@ -1,15 +1,15 @@
 # vpn - Simple WireGuard User Manager
 
-This is a small Bash script to manage WireGuard users and access control on a single WireGuard server.
+A Bash script to manage WireGuard users and access control on a single WireGuard server with a flexible tag-based system.
 
-It can:
+Features:
 
-- Initialize a new WireGuard server (optional)
-- Add/remove VPN users
-- Generate client `.conf` files
-- Restrict each user’s access to your LAN using iptables (full / single / multi)
-- Restart WireGuard
-- Show user list and get client configs
+- Initialize a new WireGuard server
+- Add/remove VPN users with tag-based access control
+- Tag-based IP organization with directory support
+- Flexible access rules (full network, single IP, multiple IPs, tag references, directory wildcards)
+- Automatic iptables ACL management using ipset
+- User and tag explanation commands
 
 ---
 
@@ -18,26 +18,24 @@ It can:
 Make sure the following are true:
 
 1. **OS / Privileges**
-   - Ubuntu/Debian-based server.
-   - You have `sudo` access (root or sudoer).
+   - Ubuntu/Debian-based server
+   - You have `sudo` access (root or sudoer)
 
 2. **Network**
-   - The server has Internet access (outbound HTTPS).
-   - Your router/firewall forwards **UDP 51820** to this server’s IP.
-   - If you are behind NAT, the forwarded public IP is the address you expect clients to reach.
+   - The server has Internet access (outbound HTTPS)
+   - Your router/firewall forwards **UDP 51820** to this server's IP
+   - If you are behind NAT, the forwarded public IP is the address you expect clients to reach
 
 3. **Not already running another WireGuard setup on `wg0`**
-   - If you already have `/etc/wireguard/wg0.conf` for another purpose, review this script carefully before running `init`. It will create or modify `wg0.conf`.
+   - If you already have `/etc/wireguard/wg0.conf` for another purpose, review this script carefully before running `init`
 
 4. **Packages**
-   - For `init`:
-     - `apt` must be available (Debian/Ubuntu).
-   - For manual usage (`start` or only `vpn add`):
-     - `wireguard`, `wireguard-tools`, `iptables`, `curl` should be installed already.
+   - The `init` command will install: `wireguard`, `wireguard-tools`, `curl`, `iptables`, `ipset`, `iptables-persistent`
+   - If WireGuard is already installed, you can use `start` to only install the script
 
 ---
 
-## Quick Start (Fresh Server, v1)
+## Quick Start
 
 1. Clone the repo and make script executable:
 
@@ -47,7 +45,7 @@ Make sure the following are true:
    chmod +x vpn
    ```
 
-2. Run full init (installs WireGuard + basic wg0.conf + iptables ACL + installs script):
+2. Run full init (installs WireGuard + dependencies + iptables ACL + installs script):
 
    ```bash
    ./vpn init
@@ -55,15 +53,14 @@ Make sure the following are true:
 
    This will:
 
-   - Install `wireguard`, `wireguard-tools`, `curl`.
-   - Create `/etc/wireguard/wg0.conf` with:
-     - Interface `wg0`
-     - Address `10.0.0.1/24`
-     - ListenPort `51820`
-     - Basic iptables NAT rules.
-   - Create `/home/wireguard/clients`, `/home/wireguard/keys`, `/home/wireguard/users.txt`.
-   - Create iptables chain `WG_ACCESS` and hook it into `FORWARD -i wg0`.
-   - Install script to `/usr/local/bin/vpn`.
+   - Install `wireguard`, `wireguard-tools`, `curl`, `iptables`, `ipset`, `iptables-persistent`
+   - Create directory structure:
+     - `/home/wireguard/clients` - Client configuration files
+     - `/home/wireguard/keys` - Private/public keys
+     - `/home/wireguard/users.txt` - User registry
+     - `/home/wireguard/tags` - Tag definitions
+   - Create iptables chain `WG_ACCESS` and hook it into `FORWARD -i wg0`
+   - Install script to `/usr/local/bin/vpn`
 
 3. Check usage:
 
@@ -75,160 +72,219 @@ Make sure the following are true:
 
 ## Commands
 
-### 1. `init` (only in v1)
+### 1. Initialize System
 
 ```bash
 ./vpn init
 ```
 
-- Use this **once** on a fresh server.
-- Installs dependencies and sets up:
-  - WireGuard (`wg0`)
-  - iptables ACL chain
-  - `/usr/local/bin/vpn`
+- Use this **once** on a fresh server
+- Installs all dependencies (WireGuard, iptables, ipset)
+- Creates directory structure
+- Sets up iptables ACL chain
+- Installs script to `/usr/local/bin/vpn`
 
-### 2. `start` (only in v1)
+### 2. Install Script Only
 
 ```bash
 ./vpn start
 ```
 
-- Only copies the script to `/usr/local/bin/vpn` (no apt, no wg0.conf).
-- Use this if WireGuard is already installed and configured.
+- Only copies the script to `/usr/local/bin/vpn`
+- Use this if WireGuard is already installed and configured
 
-### 3. Add user
-
-```bash
-vpn add <username> <full|single|multi> [target]
-```
-
-- `full`  
-  - User can access:
-    - `10.0.0.0/24` (VPN subnet)
-    - `192.168.219.0/24` (your home LAN, example)
-  - Example:
-    ```bash
-    vpn add alice full
-    ```
-
-- `single`  
-  - User can access only one LAN IP.
-  - Example:
-    ```bash
-    vpn add bob single 192.168.219.100
-    ```
-
-- `multi`  
-  - User can access multiple LAN IPs (comma-separated).
-  - Example:
-    ```bash
-    vpn add charlie multi 192.168.219.100,192.168.219.101
-    ```
-
-Each `add` will:
-
-- Append a `[Peer]` block to `/etc/wireguard/wg0.conf`.
-- Assign a VPN IP `10.0.0.X/32`.
-- Create keys in `/home/wireguard/keys`.
-- Create client config in `/home/wireguard/clients/<username>.conf`.
-- Log entry in `/home/wireguard/users.txt`.
-- Add iptables rules in `WG_ACCESS` based on `TYPE` and `TARGET`.
-
-> After adding users, **restart WireGuard**:
+### 3. Add User
 
 ```bash
-vpn restart
+vpn add <username> <target>
 ```
+
+The `target` parameter supports multiple formats:
+
+- **`full`** - Access to entire LAN subnet (192.168.219.0/24)
+  ```bash
+  vpn add alice full
+  ```
+
+- **Single IP** - Access to one specific IP
+  ```bash
+  vpn add bob 192.168.0.10
+  ```
+
+- **Multiple IPs** - Comma-separated list
+  ```bash
+  vpn add charlie 192.168.0.10,192.168.0.11
+  ```
+
+- **Tag reference** - Use a predefined tag
+  ```bash
+  vpn add david example/db
+  ```
+
+- **Directory wildcard** - All tags in a directory
+  ```bash
+  vpn add eve example/
+  ```
+
+Each `add` command will:
+- Append a `[Peer]` block to `/etc/wireguard/wg0.conf`
+- Assign a VPN IP `10.0.0.X/32`
+- Generate keys in `/home/wireguard/keys`
+- Log entry in `/home/wireguard/users.txt`
+- Create iptables rules using ipset for efficient filtering
+- Apply rules immediately (no restart needed)
 
 ---
 
-### 4. Remove user
+### 4. Remove User
 
 ```bash
 vpn remove <username>
 ```
 
 This will:
-
-- Remove the peer from the running `wg0`.
-- Remove the peer block from `/etc/wireguard/wg0.conf`.
-- Delete keys and client config.
-- Remove the log line from `users.txt`.
-- Remove iptables rules for that user’s VPN IP.
-
-Then:
-
-```bash
-vpn restart
-```
+- Remove the peer from running `wg0`
+- Delete keys and configuration
+- Remove log entry from `users.txt`
+- Remove associated iptables/ipset rules
 
 ---
 
-### 5. List users
+### 5. List Users
 
 ```bash
 vpn list
 ```
 
-Prints:
-
+Shows all users with:
 - Username
-- VPN IP (AllowedIPs in server config)
-- TYPE (full/single/multi)
-- TARGET (allowed LAN IPs, if any)
+- VPN IP (10.0.0.X)
+- Access rule definition
+- Creation date
 
 ---
 
-### 6. Restart WireGuard
+### 6. Tag Management
+
+Create tags to organize IP addresses:
 
 ```bash
-vpn restart
+# Add a tag
+vpn tag add <ip> <tag_name>
+
+# Example: Create a database server tag
+vpn tag add 192.168.0.100 production/db
+
+# Remove a tag
+vpn tag remove <tag_name>
 ```
 
-- Runs `systemctl restart wg-quick@wg0`.
-- Shows first few lines of status.
+Tags support directory structure:
+- `production/db`
+- `production/web`
+- `development/api`
+
+Use directory wildcards when adding users: `vpn add user production/`
 
 ---
 
-### 7. Get client config
+### 7. Explain Command
+
+Get detailed information about users, tags, or directories:
 
 ```bash
-vpn get <username>
+# Explain a user's access
+vpn explain <username>
+
+# Show what IP a tag points to
+vpn explain <tag_name>
+
+# List all tags in a directory
+vpn explain <directory/>
 ```
 
-- Prints `/home/wireguard/clients/<username>.conf`.
+---
 
-You can send this file (or copy-paste content) to your user and import it into the WireGuard client app.
+### 8. Show Guide
+
+```bash
+vpn guide
+```
+
+Displays usage guide and available commands
 
 ---
 
 ## Access Control Model
 
-- Server-side `[Peer]` in `wg0.conf`:
+This script uses a layered security approach:
 
-  - `AllowedIPs = 10.0.0.X/32` (identifies each client).
-  - Does **not** control LAN access directly.
+### WireGuard Layer
+- Server `wg0.conf` `[Peer]` blocks use `AllowedIPs = 10.0.0.X/32` to identify each client
+- This does **not** control LAN access directly
 
-- Client-side config:
+### iptables + ipset Layer
+- All access control is enforced via the `WG_ACCESS` iptables chain
+- For `full` access: Direct iptables rule allowing entire LAN subnet
+- For specific IPs: Uses ipset for efficient multi-IP matching
+  - Each user gets a dedicated ipset: `user_10_0_0_X`
+  - Tag/directory references are resolved to IPs and added to the set
+  - iptables rule matches against the ipset
+- Final DROP rule ensures deny-by-default
 
-  - `AllowedIPs = 10.0.0.0/24,192.168.219.0/24`
-  - Controls routing only (which destinations go through the tunnel).
+### Security Benefits
+- Even if a client modifies their config file, the server controls actual access
+- ipset provides O(1) lookup for large IP lists
+- Tag system allows centralized IP management
+- Directory structure enables logical grouping
 
-- Actual access control:
+---
 
-  - Enforced with iptables chain `WG_ACCESS`:
-    - `full`: `-s 10.0.0.X/32 -d 192.168.219.0/24 -j ACCEPT` then `DROP`
-    - `single`: `-s 10.0.0.X/32 -d 192.168.219.Y/32 -j ACCEPT` then `DROP`
-    - `multi`: multiple `-d IP/32 -j ACCEPT` then `DROP`
+## Example Workflows
 
-So even if a client edits their config, the server still decides what they can reach.
+### Example 1: Database Access
+
+```bash
+# Create tags for database servers
+vpn tag add 192.168.0.100 production/db-primary
+vpn tag add 192.168.0.101 production/db-replica
+
+# Add a DBA with access to both
+vpn add dba production/
+
+# Add a developer with limited access
+vpn add dev1 production/db-replica
+```
+
+### Example 2: Multi-Environment Access
+
+```bash
+# Set up environment tags
+vpn tag add 192.168.0.10 dev/api
+vpn tag add 192.168.0.11 dev/web
+vpn tag add 192.168.0.20 staging/api
+vpn tag add 192.168.0.21 staging/web
+
+# Developer gets all dev environment
+vpn add developer dev/
+
+# QA gets dev + staging
+vpn add qa dev/,staging/
+```
+
+### Example 3: Mixed Access
+
+```bash
+# Specific IPs + tag reference + directory
+vpn add admin 192.168.0.1,production/db,monitoring/
+```
 
 ---
 
 ## Notes
 
-- This script is opinionated and tailored for:
-  - Single WireGuard interface named `wg0`.
-  - VPN subnet `10.0.0.0/24`.
-  - Example LAN subnet `192.168.219.0/24` (change in script if needed).
-- Always review the script before using it on production systems.
+- **VPN subnet**: `10.0.0.0/24` (configurable in script)
+- **Default LAN subnet**: `192.168.219.0/24` (change `add_acl_rules` function if needed)
+- **Interface**: `wg0` only
+- **Tag storage**: `/home/wireguard/tags/` with directory support
+- Always review and test the script before production use
